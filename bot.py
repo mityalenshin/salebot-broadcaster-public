@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 import audience
 import broadcast
+import config
 import db
 import post_builder
 import wizard
@@ -142,6 +143,210 @@ def cmd_segments(message):
     bot.send_message(message.chat.id, body)
 
 
+# ============================================================
+# TEMPLATES — шаблоны рассылок
+# ============================================================
+
+@bot.message_handler(commands=["save_template"])
+def cmd_save_template(message):
+    if not is_authorized(message):
+        return
+    name = parse_command_args(message).strip()
+    if not name:
+        bot.reply_to(message,
+            "Использование: реплай на сообщение командой <code>/save_template имя</code>\n"
+            "Имя — одним словом без пробелов, например <code>webinar_reminder</code>")
+        return
+    if " " in name or "/" in name:
+        bot.reply_to(message, "⚠️ Имя без пробелов и слэшей. Примеры: <code>promo_2026</code>, <code>black_friday</code>")
+        return
+    if not message.reply_to_message:
+        bot.reply_to(message, "⚠️ Реплай командой <code>/save_template</code> на сообщение, которое сохраняем.")
+        return
+
+    text, raw_photo_id, buttons = build_post_from_reply(message)
+    if not text and not raw_photo_id:
+        bot.reply_to(message, "⚠️ В реплае нет ни текста, ни фото.")
+        return
+
+    # Если есть фото — перезалить через бот рассылок (file_id привязан к боту)
+    photo_file_id = None
+    if raw_photo_id:
+        try:
+            photo_file_id = post_builder.reupload_photo(raw_photo_id, TEST_USER_IDS[0])
+        except Exception as e:
+            bot.reply_to(message, f"❌ Не удалось перезалить фото: {e}")
+            return
+
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.UTC).isoformat()
+    created_by = message.from_user.username or str(message.from_user.id)
+    try:
+        with db.connect() as c:
+            c.execute(
+                """INSERT INTO templates (name, text, photo_file_id, buttons_json, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                       text=excluded.text,
+                       photo_file_id=excluded.photo_file_id,
+                       buttons_json=excluded.buttons_json""",
+                (name, text, photo_file_id,
+                 __import__("json").dumps(buttons, ensure_ascii=False) if buttons else None,
+                 created_by, now)
+            )
+            c.commit()
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка сохранения: {e}")
+        return
+
+    extras = []
+    if photo_file_id: extras.append("📸 фото")
+    if buttons: extras.append(f"🔘 {sum(len(r) for r in buttons)} кнопок")
+    extras_str = " + ".join(extras) if extras else "только текст"
+    bot.reply_to(message,
+        f"✅ Шаблон <b>{escape(name)}</b> сохранён ({extras_str}).\n\n"
+        f"Использовать: <code>/use_template {name}</code>")
+
+
+@bot.message_handler(commands=["templates"])
+def cmd_templates(message):
+    if not is_authorized(message):
+        return
+    with db.connect() as c:
+        rows = c.execute(
+            """SELECT name, text, photo_file_id, buttons_json,
+                      used_count, last_used_at, created_at, created_by
+               FROM templates ORDER BY last_used_at DESC NULLS LAST, created_at DESC LIMIT 30"""
+        ).fetchall()
+    if not rows:
+        bot.reply_to(message,
+            "Пока нет ни одного шаблона. Сохрани первый:\n"
+            "  • реплай на сообщение командой <code>/save_template имя</code>")
+        return
+    body = f"<b>📋 Шаблоны ({len(rows)}):</b>\n\n"
+    for r in rows:
+        extras = []
+        if r["photo_file_id"]: extras.append("📸")
+        if r["buttons_json"]: extras.append("🔘")
+        extras_str = " ".join(extras)
+        body += (f"<code>/use_template {r['name']}</code> {extras_str}\n"
+                f"  использован: {r['used_count']}× "
+                f"(автор @{escape(r['created_by'] or '?')})\n")
+    body += "\nКоманды:\n"
+    body += "  <code>/use_template имя</code> — взять шаблон\n"
+    body += "  <code>/delete_template имя</code> — удалить"
+    bot.send_message(message.chat.id, body)
+
+
+@bot.message_handler(commands=["use_template"])
+def cmd_use_template(message):
+    if not is_authorized(message):
+        return
+    name = parse_command_args(message).strip()
+    if not name:
+        bot.reply_to(message, "Использование: <code>/use_template имя</code>. Список: /templates")
+        return
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM templates WHERE name=?", (name,)).fetchone()
+    if not r:
+        bot.reply_to(message, f"Шаблона <code>{escape(name)}</code> нет. Список: /templates")
+        return
+
+    import json as _json, datetime as _dt
+    buttons = _json.loads(r["buttons_json"]) if r["buttons_json"] else []
+    text = r["text"] or ""
+
+    # Восстанавливаем «исходный» вид сообщения, который ты потом можешь использовать
+    # с /preview или /send (реплай). Кнопки добавляем хвостом в формате [текст | url].
+    body = text
+    if buttons:
+        body += "\n\n"
+        for row in buttons:
+            for btn_text, url in row:
+                body += f"[{btn_text} | {url}]\n"
+
+    # Шлём сообщение от лица бота команд — на него можно сделать реплай /preview или /send
+    if r["photo_file_id"]:
+        # photo_file_id привязан к боту рассылок — отправляем через post_builder
+        try:
+            sent = post_builder.send_via_broadcast_bot(
+                message.chat.id, body, photo_file_id=r["photo_file_id"]
+            )
+            mid = sent["message_id"]
+        except Exception as e:
+            bot.reply_to(message, f"❌ Не удалось отправить шаблон с фото: {e}")
+            return
+    else:
+        sent_msg = bot.send_message(message.chat.id, body)
+
+    # Обновляем счётчик
+    with db.connect() as c:
+        c.execute(
+            "UPDATE templates SET used_count=used_count+1, last_used_at=? WHERE name=?",
+            (_dt.datetime.now(_dt.UTC).isoformat(), name)
+        )
+        c.commit()
+
+    bot.send_message(message.chat.id,
+        f"☝️ Шаблон <b>{escape(name)}</b> вставлен выше.\n"
+        f"Сделай реплай командой <code>/preview</code> или <code>/send</code> — отправит как обычно.")
+
+
+@bot.message_handler(commands=["delete_template"])
+def cmd_delete_template(message):
+    if not is_authorized(message):
+        return
+    name = parse_command_args(message).strip()
+    if not name:
+        bot.reply_to(message, "Использование: <code>/delete_template имя</code>")
+        return
+    with db.connect() as c:
+        n = c.execute("DELETE FROM templates WHERE name=?", (name,)).rowcount
+        c.commit()
+    if n:
+        bot.reply_to(message, f"🗑 Шаблон <code>{escape(name)}</code> удалён.")
+    else:
+        bot.reply_to(message, f"Шаблона <code>{escape(name)}</code> нет.")
+
+
+# ============================================================
+
+@bot.message_handler(commands=["myid"])
+def cmd_myid(message):
+    """Показывает все ID этого чата — пользователю не нужны другие боты."""
+    if not is_authorized(message):
+        return
+    u = message.from_user
+    chat = message.chat
+
+    body = "<b>🆔 Идентификаторы</b>\n\n"
+    body += "<b>Ты:</b>\n"
+    body += f"  user_id: <code>{u.id}</code>\n"
+    body += f"  username: @{u.username or '—'}\n"
+    body += f"  имя: {escape((u.first_name or '') + ' ' + (u.last_name or '')).strip()}\n\n"
+    body += "<b>Этот чат:</b>\n"
+    body += f"  chat_id: <code>{chat.id}</code>\n"
+    body += f"  type: <code>{chat.type}</code>\n"
+    if chat.title:
+        body += f"  title: {escape(chat.title)}\n"
+
+    if message.reply_to_message:
+        r = message.reply_to_message
+        body += "\n<b>Сообщение, на которое ты ответил:</b>\n"
+        if r.from_user:
+            body += f"  автор user_id: <code>{r.from_user.id}</code>\n"
+            body += f"  username: @{r.from_user.username or '—'}\n"
+            body += f"  имя: {escape((r.from_user.first_name or '') + ' ' + (r.from_user.last_name or '')).strip()}\n"
+        if r.forward_from:
+            body += f"  пересылка от user_id: <code>{r.forward_from.id}</code>\n"
+        if r.forward_from_chat:
+            body += f"  пересылка из канала: <code>{r.forward_from_chat.id}</code> ({escape(r.forward_from_chat.title or '?')})\n"
+
+    body += ("\n<i>💡 Чтобы узнать ID другого пользователя — попроси его написать "
+             "тебе сообщение, перешли это сообщение мне и сделай реплай этой командой.</i>")
+    bot.reply_to(message, body)
+
+
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
     if not is_authorized(message):
@@ -155,6 +360,7 @@ def cmd_stats(message):
         ("not_started", "⚠️  not_started"),
         ("unknown",     "❓ unknown    "),
         ("invalid",     "⛔ invalid    "),
+        ("excluded",    "🛑 excluded   "),
     ]
     total_main = sum(by_status.values())
     body = (
@@ -421,6 +627,42 @@ def on_confirm(cb):
     threading.Thread(target=run_in_thread, daemon=True).start()
 
 
+@bot.message_handler(commands=["abort"])
+def cmd_abort(message):
+    """Прервать активную рассылку — уже отправленные останутся, остальное — нет."""
+    if not is_authorized(message):
+        return
+    if not broadcast.is_running():
+        bot.reply_to(message, "Активной рассылки нет.")
+        return
+    info = broadcast.lock_info() or {}
+    bid = info.get("broadcast_id")
+    if not bid:
+        bot.reply_to(message, "Не нашёл активную рассылку.")
+        return
+    if broadcast.abort(bid):
+        bot.reply_to(message, f"⏸ Запрошена отмена рассылки #{bid}. Воркеры завершатся в течение нескольких секунд.")
+    else:
+        bot.reply_to(message, f"Рассылка #{bid} уже не активна.")
+
+
+@bot.callback_query_handler(func=lambda cb: cb.data.startswith("abort:"))
+def on_abort_button(cb):
+    """Кнопка «Прервать» под прогресс-сообщением."""
+    if cb.from_user.username and cb.from_user.username.lower() not in ADMIN_USERNAMES:
+        bot.answer_callback_query(cb.id, "Нет прав")
+        return
+    bid = int(cb.data.split(":", 1)[1])
+    if broadcast.abort(bid):
+        bot.answer_callback_query(cb.id, "Рассылка прервана")
+        try:
+            bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+    else:
+        bot.answer_callback_query(cb.id, "Уже не активна")
+
+
 @bot.message_handler(commands=["status"])
 def cmd_status(message):
     if not is_authorized(message):
@@ -596,6 +838,9 @@ def on_wizard_content(message):
     preview_name = message.from_user.first_name or message.from_user.username or "друг"
     preview_text = broadcast.personalize(text, preview_name)
 
+    # На этапе содержимого мы ещё не знаем какой бот выберем — превью идёт через основной.
+    # На шаге выбора бота, если ученик выберет другой бот и он понадобится для финальной отправки —
+    # фото нужно будет перезалить с его токеном. Сделаем это перед /send.
     if photo_file_id:
         if len(text) > 1024:
             bot.reply_to(message,
@@ -613,7 +858,6 @@ def on_wizard_content(message):
             wizard.cancel(state.user_id)
             return
     else:
-        # Текстовое превью на тестовых
         for uid in TEST_USER_IDS:
             try:
                 post_builder.send_via_broadcast_bot(uid, preview_text, buttons=buttons)
@@ -628,21 +872,30 @@ def on_wizard_content(message):
 
 def show_wizard_bot_step(state):
     s = audience.list_segments()
+    available_tokens = config.get_bot_tokens()
     kb = types.InlineKeyboardMarkup()
+    extras_count = 0
     for name, active, total in s["bots"]:
         if not name:
             continue
-        # Активные — главные кандидаты, остальные показываем серыми с (0)
-        label = f"{'⭐' if active else '·'} {name} ({active:,} active)"
-        kb.row(types.InlineKeyboardButton(label, callback_data=f"wiz_bot:{name}"))
+        if name in available_tokens:
+            mark = "⭐" if active else "·"
+            label = f"{mark} {name} ({active:,} active)"
+            kb.row(types.InlineKeyboardButton(label, callback_data=f"wiz_bot:{name}"))
+        else:
+            extras_count += 1
     kb.row(types.InlineKeyboardButton("❌ Отмена", callback_data="wiz_cancel"))
-    bot.send_message(
-        state.chat_id,
+
+    body = (
         "🤖 <b>Шаг 2/4 — выбери бота</b>\n\n"
-        "Сейчас рассылка идёт через тот бот, чей токен прописан в <code>.env</code>.\n"
-        "У звёздочек ⭐ есть проверенная активная аудитория.",
-        reply_markup=kb,
+        "Доступны только те боты, для которых задан токен в <code>.env</code>.\n"
+        "У звёздочек ⭐ есть проверенная активная аудитория."
     )
+    if extras_count:
+        body += (f"\n\n<i>Ещё {extras_count} ботов в базе клиентов, но без токена — "
+                 "чтобы рассылать через них, добавь в .env строку "
+                 "<code>EXTRA_BOT_TOKEN_&lt;username&gt;=...</code></i>")
+    bot.send_message(state.chat_id, body, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda cb: cb.data.startswith("wiz_bot:"))
@@ -652,6 +905,25 @@ def on_wiz_bot(cb):
         bot.answer_callback_query(cb.id, "Визард не активен")
         return
     state.selected_bot = cb.data.split(":", 1)[1]
+
+    # Если фото загружалось через основной бот, а пользователь выбрал другой —
+    # надо перезалить с токеном выбранного, иначе sendPhoto не сработает.
+    if state.photo_command_file_id and state.selected_bot != config.PRIMARY_BOT_USERNAME:
+        token = config.get_bot_token(state.selected_bot)
+        if not token:
+            bot.answer_callback_query(cb.id, "У этого бота нет токена в .env")
+            return
+        try:
+            state.photo_broadcast_file_id = post_builder.reupload_photo(
+                state.photo_command_file_id, TEST_USER_IDS[0],
+                caption=broadcast.personalize(state.text, cb.from_user.first_name or "друг"),
+                buttons=state.buttons,
+                broadcast_token=token,
+            )
+        except Exception as e:
+            bot.answer_callback_query(cb.id, f"Перезаливка фото упала: {e}")
+            return
+
     state.step = "segment"
     bot.answer_callback_query(cb.id, f"Бот: {state.selected_bot}")
     try:
@@ -1071,7 +1343,9 @@ def _launch_broadcast_from_wizard(state, user):
         filters["tags"] = state.selected_tags
     total, targets = audience.select(**filters)
 
-    progress_msg = bot.send_message(chat_id, f"📨 0 / {total:,}")
+    abort_kb = types.InlineKeyboardMarkup()
+    abort_kb.row(types.InlineKeyboardButton("⏸ Прервать рассылку", callback_data=f"abort:{bid}"))
+    progress_msg = bot.send_message(chat_id, f"📨 0 / {total:,}", reply_markup=abort_kb)
     progress_state = {"last": ""}
 
     def on_progress(p: dict):
@@ -1084,7 +1358,7 @@ def _launch_broadcast_from_wizard(state, user):
             return
         progress_state["last"] = new
         try:
-            bot.edit_message_text(new, chat_id, progress_msg.message_id)
+            bot.edit_message_text(new, chat_id, progress_msg.message_id, reply_markup=abort_kb)
         except Exception:
             pass
 
@@ -1099,13 +1373,16 @@ def _launch_broadcast_from_wizard(state, user):
                 buttons=state.buttons,
                 add_utm=state.add_utm,
                 spread_minutes=state.spread_minutes,
+                bot_token=config.get_bot_token(state.selected_bot),
                 on_progress=on_progress,
                 progress_every=300,
             )
+            icon = "⏸" if result.get("status") == "aborted" else "✅"
+            label = "ОТМЕНЕНА" if result.get("status") == "aborted" else "завершена"
             bot.send_message(
                 chat_id,
-                f"✅ <b>Рассылка #{bid} завершена</b>\n"
-                f"Отправлено: <b>{result['sent']:,}</b>\n"
+                f"{icon} <b>Рассылка #{bid} {label}</b>\n"
+                f"Отправлено: <b>{result['sent']:,}</b> из {result['total']:,}\n"
                 f"Ошибок: {result['failed']:,}\n"
                 f"Заблокировали в процессе: {result['blocked']:,}\n"
                 f"Разбивка ошибок: <code>{escape(str(result['by_error']))}</code>"
@@ -1174,6 +1451,190 @@ def cmd_cancel_scheduled(message):
     bot.reply_to(message, f"🚫 Рассылка #{bid} отменена.")
 
 
+# ============================================================
+# EXCLUDE list — исключения из рассылок
+# ============================================================
+
+def find_clients_by_query(query: str, limit: int = 20) -> list[dict]:
+    """Поиск клиента по chat_id (точное) или по части имени."""
+    query = query.strip()
+    if not query:
+        return []
+    with db.connect() as c:
+        # Если число — ищем по platform_id
+        if query.isdigit():
+            rows = c.execute(
+                "SELECT id, platform_id, name, bot_group, tag, is_active "
+                "FROM clients WHERE platform_id = ? LIMIT ?",
+                (query, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id, platform_id, name, bot_group, tag, is_active "
+                "FROM clients WHERE name LIKE ? ORDER BY updated_at DESC LIMIT ?",
+                (f"%{query}%", limit),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def format_client_short(c: dict) -> str:
+    return (f"<b>#{c['id']}</b> (chat {c['platform_id']}) — "
+            f"{escape(c['name'] or '?')}, "
+            f"бот <code>{c['bot_group']}</code>, "
+            f"тег <code>{c['tag'] or '—'}</code>, "
+            f"статус <code>{c['is_active']}</code>")
+
+
+@bot.message_handler(commands=["exclude"])
+def cmd_exclude(message):
+    if not is_authorized(message):
+        return
+    query = parse_command_args(message).strip()
+    if not query:
+        bot.reply_to(message,
+            "Использование:\n"
+            "<code>/exclude 5333376244</code> — по chat_id\n"
+            "<code>/exclude Иоанн</code> — по имени (если несколько — выберешь из списка)")
+        return
+
+    # Защита: -100... это id канала или супергруппы, не клиента
+    if query.startswith("-100") or (query.startswith("-") and query[1:].isdigit()):
+        bot.reply_to(message,
+            "⚠️ Это похоже на <b>chat_id канала или группы</b>, а не пользователя.\n\n"
+            "В рассылках участвуют только <b>личные пользователи</b> (с положительным user_id), "
+            "которые сделали <code>/start</code> твоему боту. Каналы и группы технически "
+            "не получают рассылку — исключать их не нужно.\n\n"
+            "Если хочешь исключить <b>человека, который ведёт этот канал</b> — нужен "
+            "его <b>user_id</b> (положительное число). Получи его так:\n"
+            "  • попроси его написать твоему боту → найдёшь в нашей базе\n"
+            "  • или ищи по имени: <code>/exclude Имя</code>"
+        )
+        return
+
+    # Защита: @username — у нас в БД не хранится, ищем по имени
+    if query.startswith("@"):
+        bot.reply_to(message,
+            "ℹ️ Username (<code>@</code>) в нашей базе не хранится — SaleBot его не отдаёт через API.\n"
+            "Попробуй искать по <b>имени</b> (как оно показано в Telegram) "
+            f"или по <b>chat_id</b>:\n"
+            f"  <code>/exclude {escape(query[1:])}</code> — по имени\n"
+            f"  <code>/exclude 5333376244</code> — по chat_id"
+        )
+        return
+
+    matches = find_clients_by_query(query, limit=20)
+    if not matches:
+        bot.reply_to(message, f"Никто не найден по запросу <code>{escape(query)}</code>.")
+        return
+
+    if len(matches) == 1:
+        _do_exclude(matches[0]["id"], matches[0]["platform_id"])
+        bot.reply_to(message, f"🚫 Исключён:\n{format_client_short(matches[0])}\n\nБольше в рассылки не попадёт.")
+        return
+
+    # Несколько совпадений — список с кнопками
+    body = f"Найдено <b>{len(matches)}</b> совпадений. Выбери кого исключить:\n\n"
+    kb = types.InlineKeyboardMarkup()
+    for c in matches[:15]:
+        body += f"• {format_client_short(c)}\n"
+        label = f"#{c['id']} {(c['name'] or '?')[:25]} · {c['bot_group']}"[:60]
+        kb.row(types.InlineKeyboardButton(label, callback_data=f"excl:{c['id']}"))
+    kb.row(types.InlineKeyboardButton("❌ Отмена", callback_data="excl:cancel"))
+    bot.reply_to(message, body, reply_markup=kb)
+
+
+def _do_exclude(client_id: int, platform_id: str):
+    """Пометить клиентов с этим platform_id как excluded — у одного человека
+    в SaleBot бывает несколько записей (на разные боты), исключаем сразу все."""
+    with db.connect() as c:
+        c.execute(
+            "UPDATE clients SET is_active='excluded' WHERE platform_id = ?",
+            (platform_id,),
+        )
+        c.commit()
+
+
+@bot.callback_query_handler(func=lambda cb: cb.data.startswith("excl:"))
+def on_excl_choice(cb):
+    if not is_authorized(cb.message):
+        return
+    val = cb.data.split(":", 1)[1]
+    if val == "cancel":
+        bot.answer_callback_query(cb.id, "отменено")
+        try: bot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=None)
+        except Exception: pass
+        return
+    cid = int(val)
+    with db.connect() as c:
+        r = c.execute("SELECT platform_id, name, bot_group FROM clients WHERE id=?", (cid,)).fetchone()
+    if not r:
+        bot.answer_callback_query(cb.id, "Клиент не найден")
+        return
+    _do_exclude(cid, r["platform_id"])
+    bot.answer_callback_query(cb.id, f"Исключён: {r['name']}")
+    try:
+        bot.edit_message_text(
+            f"🚫 Исключён <b>{escape(r['name'] or '?')}</b> (chat {r['platform_id']}).\n"
+            f"Все его записи во всех ботах помечены как <code>excluded</code>.",
+            cb.message.chat.id, cb.message.message_id,
+        )
+    except Exception: pass
+
+
+@bot.message_handler(commands=["include"])
+def cmd_include(message):
+    if not is_authorized(message):
+        return
+    query = parse_command_args(message).strip()
+    if not query:
+        bot.reply_to(message, "Использование: <code>/include 5333376244</code> или <code>/include Имя</code>")
+        return
+    matches = find_clients_by_query(query, limit=10)
+    matches = [m for m in matches if m["is_active"] == "excluded"]
+    if not matches:
+        bot.reply_to(message, "Среди исключённых никого не нашёл.")
+        return
+    pid = matches[0]["platform_id"]
+    with db.connect() as c:
+        n = c.execute(
+            "UPDATE clients SET is_active='unknown' WHERE platform_id = ? AND is_active = 'excluded'",
+            (pid,),
+        ).rowcount
+        c.commit()
+    bot.reply_to(message,
+        f"✅ Снято исключение с <b>{escape(matches[0]['name'] or '?')}</b> "
+        f"(chat {pid}). Записей обновлено: {n}.\n"
+        "Активность будет перепроверена при следующем check_alive.")
+
+
+@bot.message_handler(commands=["excluded"])
+def cmd_excluded(message):
+    if not is_authorized(message):
+        return
+    with db.connect() as c:
+        rows = c.execute(
+            """SELECT platform_id, GROUP_CONCAT(DISTINCT name) AS names,
+                      GROUP_CONCAT(DISTINCT bot_group) AS bots,
+                      MAX(updated_at) AS last_upd
+               FROM clients WHERE is_active = 'excluded'
+               GROUP BY platform_id ORDER BY last_upd DESC LIMIT 50"""
+        ).fetchall()
+    if not rows:
+        bot.reply_to(message, "Список исключений пуст.")
+        return
+    body = f"<b>🚫 Исключённые ({len(rows)})</b>\n\n"
+    for r in rows:
+        body += (f"chat <code>{r['platform_id']}</code> — "
+                f"{escape(r['names'] or '?')[:40]} "
+                f"(<code>{escape(r['bots'] or '?')[:40]}</code>)\n")
+    body += "\nСнять исключение: <code>/include &lt;chat_id&gt;</code>"
+    bot.send_message(message.chat.id, body)
+
+
+# ============================================================
+# Прочие админские команды
+# ============================================================
+
 @bot.message_handler(commands=["cancel_lock"])
 def cmd_cancel_lock(message):
     if not is_authorized(message):
@@ -1194,7 +1655,15 @@ BOT_COMMANDS = [
     types.BotCommand("segments",         "Доступные сегменты (теги, боты)"),
     types.BotCommand("preview",          "Превью (реплаем) — быстрая отправка"),
     types.BotCommand("send",             "Рассылка (реплаем) — быстрая отправка"),
+    types.BotCommand("templates",        "📋 Шаблоны рассылок"),
+    types.BotCommand("save_template",    "Сохранить шаблон (реплаем): /save_template имя"),
+    types.BotCommand("use_template",     "Вставить шаблон: /use_template имя"),
+    types.BotCommand("exclude",          "🚫 Исключить из рассылок: /exclude <id или имя>"),
+    types.BotCommand("excluded",         "Список исключённых"),
+    types.BotCommand("include",          "Снять исключение: /include <id>"),
+    types.BotCommand("myid",             "🆔 Показать chat_id этого чата и user_id"),
     types.BotCommand("status",           "Прогресс активной рассылки"),
+    types.BotCommand("abort",            "⏸ Прервать активную рассылку"),
     types.BotCommand("history",          "История последних 10 рассылок"),
     types.BotCommand("broadcast",        "Детали по рассылке: /broadcast <id>"),
     types.BotCommand("cancel_lock",      "Снять lock-файл (если процесс упал)"),
@@ -1236,9 +1705,13 @@ def scheduler_loop():
                     c.execute("UPDATE broadcasts SET status='running' WHERE id=?", (bid,))
                     c.commit()
 
+                abort_kb = types.InlineKeyboardMarkup()
+                abort_kb.row(types.InlineKeyboardButton(
+                    "⏸ Прервать рассылку", callback_data=f"abort:{bid}"))
                 progress_msg = bot.send_message(
                     WORK_CHAT_ID,
                     f"🚀 Авто-запуск запланированной #{bid}...\n📨 0",
+                    reply_markup=abort_kb,
                 )
 
                 def make_progress_handler(mid):

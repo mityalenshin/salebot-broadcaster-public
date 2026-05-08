@@ -98,7 +98,7 @@ def check_one(chat_id: str) -> tuple[str, str | None]:
 
 
 def select_targets(conn) -> list[tuple[int, str]]:
-    where = "bot_group = ? AND client_type = 1 AND platform_id != ''"
+    where = "bot_group = ? AND client_type = 1 AND platform_id != '' AND is_active != 'excluded'"
     if not RECHECK:
         where += " AND is_active = 'unknown'"
     rows = conn.execute(

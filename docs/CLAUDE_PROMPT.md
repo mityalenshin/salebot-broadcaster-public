@@ -10,7 +10,7 @@
 ```
 Привет. Я хочу развернуть систему рассылок salebot-broadcaster на своём VPS.
 Это open-source проект для Telegram-рассылок поверх SaleBot — экономит квоту тарифа.
-Репозиторий: https://github.com/mityalenshin/salebot-broadcaster-public
+Репозиторий: https://github.com/mityalenshin/salebot-broadcaster
 
 Тебе нужно:
 1. Подключиться к моему VPS по SSH.
@@ -43,7 +43,7 @@ SaleBot:
   API_KEY:  [api_ключ]
 
 Доступ к боту команд:
-  Мой Telegram username (без @): [your_username]
+  Мой Telegram username (без @): [mityalenshin]
   Мой chat_id (личный):           [123456789]
   Chat_id рабочей группы:         [-100123456789]
 
@@ -55,7 +55,7 @@ SaleBot:
 3. На VPS:
    a) Создай deploy SSH-ключ для приватного доступа к репо (если репо приватный)
       ИЛИ просто склонируй публичный репо.
-      git clone https://github.com/mityalenshin/salebot-broadcaster-public.git /root/salebot-broadcaster
+      git clone https://github.com/mityalenshin/salebot-broadcaster.git /root/salebot-broadcaster
    b) cd /root/salebot-broadcaster
    c) cp .env.example .env
    d) Открой .env и аккуратно впиши все мои данные выше. WEBHOOK_SECRET и DASHBOARD_TOKEN

@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 import audience
 import broadcast
+import config
 import db
 import post_builder
 
@@ -201,6 +202,7 @@ def run_scheduled(broadcast_id: int, on_progress=None) -> dict:
         conn.execute("UPDATE broadcasts SET total=? WHERE id=?", (total, broadcast_id))
         conn.commit()
 
+    bot_group = filters.get("bot_group", config.PRIMARY_BOT_USERNAME)
     return broadcast.run(
         broadcast_id=broadcast_id,
         targets=targets,
@@ -210,6 +212,7 @@ def run_scheduled(broadcast_id: int, on_progress=None) -> dict:
         buttons=buttons,
         add_utm=options.get("add_utm", False),
         spread_minutes=options.get("spread_minutes", 0),
+        bot_token=config.get_bot_token(bot_group),
         on_progress=on_progress,
         progress_every=300,
     )

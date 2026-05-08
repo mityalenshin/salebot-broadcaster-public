@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS migration_log (
     note        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS templates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT UNIQUE NOT NULL,
+    text            TEXT NOT NULL,
+    photo_file_id   TEXT,
+    buttons_json    TEXT,
+    created_by      TEXT,
+    created_at      TEXT,
+    used_count      INTEGER DEFAULT 0,
+    last_used_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS broadcasts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     text            TEXT NOT NULL,

@@ -26,8 +26,8 @@ import db
 
 load_dotenv()
 
-TOKEN = os.environ["TELEGRAM_BROADCAST_BOT_TOKEN"]
-TG_API = f"https://api.telegram.org/bot{TOKEN}"
+# Дефолтный токен — основной бот рассылок. broadcast.run() может принять любой другой.
+DEFAULT_TOKEN = os.environ["TELEGRAM_BROADCAST_BOT_TOKEN"]
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -168,10 +168,11 @@ def add_utm_to_buttons(buttons: list[list[tuple[str, str]]] | None,
 
 
 def _send_one(session: requests.Session, limiter: RateLimiter,
+              tg_api: str,
               chat_id: str, text: str, parse_mode: str | None,
               photo_file_id: str | None = None,
               reply_markup: dict | None = None) -> tuple[bool, str | None]:
-    """Отправляет одно сообщение. Если photo_file_id задан — sendPhoto с caption, иначе sendMessage."""
+    """Отправляет одно сообщение. tg_api — base URL вида https://api.telegram.org/bot<TOKEN>"""
     if photo_file_id:
         method = "sendPhoto"
         payload = {"chat_id": int(chat_id), "photo": photo_file_id, "caption": text}
@@ -187,7 +188,7 @@ def _send_one(session: requests.Session, limiter: RateLimiter,
     for attempt in range(MAX_429_RETRIES):
         limiter.acquire()
         try:
-            r = session.post(f"{TG_API}/{method}", json=payload, timeout=SEND_TIMEOUT)
+            r = session.post(f"{tg_api}/{method}", json=payload, timeout=SEND_TIMEOUT)
             data = r.json()
         except (requests.RequestException, ValueError):
             return False, "error"
@@ -208,6 +209,27 @@ def _send_one(session: requests.Session, limiter: RateLimiter,
 # Защищаем общий cursor SQLite — обновлять статус из множества потоков.
 _db_lock = threading.Lock()
 
+# Регистр активных рассылок — для возможности abort'нуть на лету.
+# {broadcast_id: threading.Event} — когда event.is_set(), воркеры выходят из цикла.
+ABORT_EVENTS: dict[int, threading.Event] = {}
+_abort_lock = threading.Lock()
+
+
+def abort(broadcast_id: int) -> bool:
+    """Запросить отмену активной рассылки. Вернёт True если она была активной."""
+    with _abort_lock:
+        ev = ABORT_EVENTS.get(broadcast_id)
+    if ev is None:
+        return False
+    ev.set()
+    return True
+
+
+def is_aborted(broadcast_id: int) -> bool:
+    with _abort_lock:
+        ev = ABORT_EVENTS.get(broadcast_id)
+    return ev is not None and ev.is_set()
+
 
 def run(broadcast_id: int,
         targets: list[tuple[int, str, str | None]],
@@ -217,6 +239,7 @@ def run(broadcast_id: int,
         buttons: list[list[tuple[str, str]]] | None = None,
         add_utm: bool = False,
         spread_minutes: int = 0,
+        bot_token: str | None = None,
         on_progress: Callable[[dict], None] | None = None,
         progress_every: int = 300) -> dict:
     """
@@ -241,6 +264,11 @@ def run(broadcast_id: int,
     _acquire_lock(broadcast_id)
     started_at = dt.datetime.now(dt.UTC).isoformat()
 
+    # Регистрируем abort-event
+    abort_event = threading.Event()
+    with _abort_lock:
+        ABORT_EVENTS[broadcast_id] = abort_event
+
     with db.connect() as conn:
         conn.execute(
             "UPDATE broadcasts SET status='running', started_at=?, total=? WHERE id=?",
@@ -251,15 +279,18 @@ def run(broadcast_id: int,
     limiter = RateLimiter(effective_rate)
     session = requests.Session()
     session.headers["Accept"] = "application/json"
+    tg_api = f"https://api.telegram.org/bot{bot_token or DEFAULT_TOKEN}"
 
     # Счётчики — защищены через lock, потому что обновляются из разных потоков.
     state = {"sent": 0, "failed": 0, "blocked_now": 0, "by_error": {}}
     state_lock = threading.Lock()
 
     def worker(item: tuple[int, str, str | None]):
+        if abort_event.is_set():
+            return  # рассылка отменена — выходим, не дёргая Telegram
         client_id, platform_id, client_name = item
         msg_text = personalize(text, client_name) if has_personalization else text
-        ok, err = _send_one(session, limiter, platform_id, msg_text, parse_mode,
+        ok, err = _send_one(session, limiter, tg_api, platform_id, msg_text, parse_mode,
                            photo_file_id=photo_file_id, reply_markup=reply_markup)
 
         with state_lock:
@@ -300,18 +331,20 @@ def run(broadcast_id: int,
                 pass
 
         finished_at = dt.datetime.now(dt.UTC).isoformat()
+        final_status = "aborted" if abort_event.is_set() else "completed"
         with db.connect() as conn:
             conn.execute(
                 """UPDATE broadcasts
-                   SET status='completed', finished_at=?, sent=?, failed=?, blocked=?
+                   SET status=?, finished_at=?, sent=?, failed=?, blocked=?
                    WHERE id=?""",
-                (finished_at, state["sent"], state["failed"],
+                (final_status, finished_at, state["sent"], state["failed"],
                  state["blocked_now"], broadcast_id),
             )
             conn.commit()
 
         result = {
             "broadcast_id": broadcast_id,
+            "status": final_status,
             "sent": state["sent"], "failed": state["failed"],
             "blocked": state["blocked_now"],
             "total": len(targets), "by_error": dict(state["by_error"]),
@@ -334,4 +367,6 @@ def run(broadcast_id: int,
             conn.commit()
         raise
     finally:
+        with _abort_lock:
+            ABORT_EVENTS.pop(broadcast_id, None)
         _release_lock()

@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 COMMAND_TOKEN = os.environ["TELEGRAM_COMMAND_BOT_TOKEN"]
-BROADCAST_TOKEN = os.environ["TELEGRAM_BROADCAST_BOT_TOKEN"]
+DEFAULT_BROADCAST_TOKEN = os.environ["TELEGRAM_BROADCAST_BOT_TOKEN"]
 
 BUTTON_RE = re.compile(r"^\[(.+?)\s*\|\s*(\S+?)\]\s*$")
 
@@ -55,15 +55,18 @@ def parse_buttons(text: str) -> tuple[str, list[list[tuple[str, str]]]]:
 
 def reupload_photo(command_bot_file_id: str, target_chat_id: int,
                   caption: str = "", buttons: list[list[tuple[str, str]]] | None = None,
-                  parse_mode: str = "HTML") -> str:
+                  parse_mode: str = "HTML",
+                  broadcast_token: str | None = None) -> str:
     """
-    Перезалить фото от ИМЕНИ бота рассылок (TELEGRAM_BROADCAST_BOT_TOKEN).
-    Бот команд скачивает по своему file_id, бот рассылок отправляет его на target_chat_id
-    с указанной подписью и кнопками — это и есть готовое превью.
+    Перезалить фото от имени конкретного бота рассылок.
+    Бот команд скачивает по своему file_id, целевой бот отправляет его на target_chat_id
+    с подписью и кнопками — это и есть готовое превью.
 
-    Возвращает file_id, валидный для бота рассылок (для последующих массовых отправок).
+    broadcast_token — токен бота, через который перезаливаем (по умолчанию основной).
+    Возвращает file_id, валидный для этого бота.
     """
-    # 1. Узнать file_path у бота команд
+    target_token = broadcast_token or DEFAULT_BROADCAST_TOKEN
+
     r = requests.get(
         f"https://api.telegram.org/bot{COMMAND_TOKEN}/getFile",
         params={"file_id": command_bot_file_id},
@@ -73,14 +76,12 @@ def reupload_photo(command_bot_file_id: str, target_chat_id: int,
         raise RuntimeError(f"getFile failed: {r}")
     file_path = r["result"]["file_path"]
 
-    # 2. Скачать файл
     file_resp = requests.get(
         f"https://api.telegram.org/file/bot{COMMAND_TOKEN}/{file_path}",
         timeout=60,
     )
     file_resp.raise_for_status()
 
-    # 3. Подготовить multipart payload
     files = {"photo": ("photo.jpg", BytesIO(file_resp.content))}
     data: dict = {"chat_id": target_chat_id}
     if caption:
@@ -94,26 +95,24 @@ def reupload_photo(command_bot_file_id: str, target_chat_id: int,
             ]
         }, ensure_ascii=False)
 
-    # 4. Залить через бота рассылок
     r = requests.post(
-        f"https://api.telegram.org/bot{BROADCAST_TOKEN}/sendPhoto",
+        f"https://api.telegram.org/bot{target_token}/sendPhoto",
         data=data, files=files, timeout=60,
     ).json()
     if not r.get("ok"):
         raise RuntimeError(f"sendPhoto (reupload) failed: {r.get('description')}")
 
-    # У результата photo — массив с разными resolution. Берём самое большое (последнее).
     return r["result"]["photo"][-1]["file_id"]
 
 
 def send_via_broadcast_bot(chat_id: int, text: str,
                           photo_file_id: str | None = None,
                           buttons: list[list[tuple[str, str]]] | None = None,
-                          parse_mode: str = "HTML") -> dict:
-    """
-    Простая обёртка для отправки одного сообщения через бот рассылок (для превью).
-    Возвращает result от Telegram API.
-    """
+                          parse_mode: str = "HTML",
+                          broadcast_token: str | None = None) -> dict:
+    """Отправка одного сообщения через бот рассылок (для превью). Возвращает result от Telegram API."""
+    target_token = broadcast_token or DEFAULT_BROADCAST_TOKEN
+
     reply_markup = None
     if buttons:
         reply_markup = {
@@ -135,7 +134,7 @@ def send_via_broadcast_bot(chat_id: int, text: str,
         payload["reply_markup"] = reply_markup
 
     r = requests.post(
-        f"https://api.telegram.org/bot{BROADCAST_TOKEN}/{method}",
+        f"https://api.telegram.org/bot{target_token}/{method}",
         json=payload, timeout=30,
     ).json()
     if not r.get("ok"):
