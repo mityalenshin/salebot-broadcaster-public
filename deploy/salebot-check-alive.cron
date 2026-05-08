@@ -1,0 +1,6 @@
+# Положить в /etc/cron.d/salebot-check-alive
+# Ежедневно в 04:00 по Москве проверяем активность новых клиентов,
+# которых добавил webhook за прошлый день. check_alive фильтрует по is_active='unknown',
+# поэтому ежедневно проверяет только реально новых.
+CRON_TZ=Europe/Moscow
+0 4 * * * root cd /opt/salebot-broadcaster && ./venv/bin/python check_alive.py >> /var/log/salebot-check-alive.log 2>&1

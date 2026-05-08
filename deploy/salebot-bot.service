@@ -1,0 +1,18 @@
+[Unit]
+Description=SaleBot Broadcaster — command bot + scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/salebot-broadcaster
+ExecStart=/opt/salebot-broadcaster/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/salebot-bot.log
+StandardError=append:/var/log/salebot-bot.log
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# Секреты — НИКОГДА не коммитить
+.env
+.env.local
+.env.*.local
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Локальные данные (БД, логи, бэкапы)
+data/
+
+# Бэкапы серверной БД (если когда-то скачали локально)
+_server_backup_*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Тестовые файлы
+*.log
+/tmp/

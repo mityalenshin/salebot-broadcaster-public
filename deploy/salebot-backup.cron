@@ -1,0 +1,3 @@
+# Положить в /etc/cron.d/salebot-backup
+# Ежедневно в 03:00 копируем SQLite БД в _backup, держим 14 дней
+0 3 * * * root cp /opt/salebot-broadcaster/data/salebot_local.db /root/_backup/salebot_local_$(date -I).db && find /root/_backup -name "salebot_local_*.db" -mtime +14 -delete

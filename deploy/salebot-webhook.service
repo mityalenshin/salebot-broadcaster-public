@@ -1,0 +1,18 @@
+[Unit]
+Description=SaleBot webhook receiver — слушает POST от SaleBot и пишет клиентов в БД
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/salebot-broadcaster
+ExecStart=/opt/salebot-broadcaster/venv/bin/python webhook.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/salebot-webhook.log
+StandardError=append:/var/log/salebot-webhook.log
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

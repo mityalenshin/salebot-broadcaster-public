@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SaleBot Broadcaster — дашборд</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+  .skel { background: linear-gradient(90deg,#f3f4f6 25%,#e5e7eb 50%,#f3f4f6 75%);
+          background-size: 200% 100%; animation: skel 1.4s infinite; }
+  @keyframes skel { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+  <header class="mb-8 flex items-baseline justify-between flex-wrap gap-2">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-semibold tracking-tight">SaleBot Broadcaster</h1>
+      <p class="text-sm text-gray-500 mt-1">Дашборд рассылок · обновляется при перезагрузке</p>
+    </div>
+    <div class="text-xs text-gray-400">
+      <span id="last-updated">—</span>
+    </div>
+  </header>
+
+  <!-- Карточки сводки -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
+    <div class="bg-white rounded-xl border border-gray-200 p-4">
+      <div class="text-xs uppercase tracking-wider text-gray-500">Всего в БД</div>
+      <div class="num text-2xl font-semibold mt-1" id="kpi-total">—</div>
+      <div class="text-xs text-gray-400 mt-1">из них TG: <span id="kpi-tg" class="num">—</span></div>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 p-4">
+      <div class="text-xs uppercase tracking-wider text-emerald-600">Активные</div>
+      <div class="num text-2xl font-semibold mt-1 text-emerald-700" id="kpi-active">—</div>
+      <div class="text-xs text-gray-400 mt-1">в основном боте</div>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 p-4">
+      <div class="text-xs uppercase tracking-wider text-rose-600">Заблокировали</div>
+      <div class="num text-2xl font-semibold mt-1 text-rose-700" id="kpi-blocked">—</div>
+      <div class="text-xs text-gray-400 mt-1">+ удалённых: <span id="kpi-deleted" class="num">—</span></div>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 p-4">
+      <div class="text-xs uppercase tracking-wider text-amber-600">Не активировали</div>
+      <div class="num text-2xl font-semibold mt-1 text-amber-700" id="kpi-not-started">—</div>
+      <div class="text-xs text-gray-400 mt-1">в работу не идут</div>
+    </div>
+  </section>
+
+  <!-- График рассылок за 30 дней -->
+  <section class="bg-white rounded-xl border border-gray-200 p-5 mb-8">
+    <div class="flex items-baseline justify-between mb-4">
+      <h2 class="text-lg font-semibold">Рассылки за 30 дней</h2>
+      <span id="timeline-empty" class="text-xs text-gray-400 hidden">пока нет данных</span>
+    </div>
+    <div class="h-72"><canvas id="timeline-chart"></canvas></div>
+  </section>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+    <!-- Таблица последних рассылок -->
+    <section class="bg-white rounded-xl border border-gray-200 p-5 lg:col-span-2 overflow-x-auto">
+      <h2 class="text-lg font-semibold mb-3">Последние рассылки</h2>
+      <table class="w-full text-sm">
+        <thead class="text-left text-xs uppercase tracking-wider text-gray-500 border-b border-gray-200">
+          <tr>
+            <th class="py-2 pr-2">#</th>
+            <th class="py-2 pr-2">Статус</th>
+            <th class="py-2 pr-2">Когда</th>
+            <th class="py-2 pr-2 num text-right">Доставлено</th>
+            <th class="py-2 pr-2 num text-right">Ошибок</th>
+            <th class="py-2 pr-2">Аудитория</th>
+          </tr>
+        </thead>
+        <tbody id="broadcasts-tbody" class="divide-y divide-gray-100">
+          <tr><td colspan="6" class="py-6 text-center text-gray-400">загружаю…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Топ сегменты/боты -->
+    <section class="bg-white rounded-xl border border-gray-200 p-5">
+      <h2 class="text-lg font-semibold mb-3">Топ ботов</h2>
+      <ul id="bots-list" class="text-sm space-y-2"></ul>
+
+      <h2 class="text-lg font-semibold mt-6 mb-3">Топ тегов</h2>
+      <ul id="tags-list" class="text-sm space-y-2"></ul>
+    </section>
+  </div>
+
+  <footer class="text-center text-xs text-gray-400 pt-6">
+    Закрытая страница · доступ по токену в URL
+  </footer>
+</div>
+
+<script>
+const TOKEN = {{ token | tojson }};
+const Q = '?token=' + encodeURIComponent(TOKEN);
+const fmt = n => (n ?? 0).toLocaleString('ru-RU');
+
+async function fetchJson(path) {
+  const r = await fetch(path + Q);
+  if (!r.ok) throw new Error(path + ': ' + r.status);
+  return r.json();
+}
+
+// ===== KPI =====
+function loadStats() {
+  fetchJson('/api/stats').then(s => {
+    const bs = s.by_status || {};
+    document.getElementById('kpi-total').textContent       = fmt(s.total);
+    document.getElementById('kpi-tg').textContent          = fmt(s.tg_total);
+    document.getElementById('kpi-active').textContent      = fmt(bs.active);
+    document.getElementById('kpi-blocked').textContent     = fmt(bs.blocked);
+    document.getElementById('kpi-deleted').textContent     = fmt(bs.deleted);
+    document.getElementById('kpi-not-started').textContent = fmt(bs.not_started);
+
+    // Список ботов
+    const ul = document.getElementById('bots-list');
+    ul.innerHTML = (s.top_bots || []).slice(0, 8).map(([name, n]) => `
+      <li class="flex justify-between items-baseline">
+        <span class="font-mono text-xs text-gray-700 truncate pr-2">${name || '—'}</span>
+        <span class="num text-gray-500">${fmt(n)}</span>
+      </li>`).join('');
+  });
+}
+
+// ===== Timeline =====
+function loadTimeline() {
+  fetchJson('/api/timeline').then(d => {
+    const empty = document.getElementById('timeline-empty');
+    if (!d.days || d.days.length === 0) { empty.classList.remove('hidden'); return; }
+    new Chart(document.getElementById('timeline-chart'), {
+      type: 'bar',
+      data: {
+        labels: d.days,
+        datasets: [
+          { label: 'Доставлено', data: d.sent,   backgroundColor: '#10b981', stack: 's' },
+          { label: 'Ошибок',     data: d.failed, backgroundColor: '#f43f5e', stack: 's' },
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { stacked: true, grid: { display: false } },
+          y: { stacked: true, ticks: { callback: v => fmt(v) } }
+        },
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12 } },
+          tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } }
+        }
+      }
+    });
+  });
+}
+
+// ===== Broadcasts table =====
+const STATUS_BADGE = {
+  completed: ['✅', 'bg-emerald-50 text-emerald-700 border-emerald-200'],
+  running:   ['🔄', 'bg-blue-50 text-blue-700 border-blue-200'],
+  scheduled: ['📅', 'bg-amber-50 text-amber-700 border-amber-200'],
+  cancelled: ['🚫', 'bg-gray-100 text-gray-500 border-gray-200'],
+  failed:    ['❌', 'bg-rose-50 text-rose-700 border-rose-200'],
+  draft:     ['📝', 'bg-gray-50 text-gray-500 border-gray-200'],
+};
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+function loadBroadcasts() {
+  fetchJson('/api/broadcasts').then(rows => {
+    const tbody = document.getElementById('broadcasts-tbody');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="py-6 text-center text-gray-400">пока пусто — сделай первую рассылку</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => {
+      const [icon, cls] = STATUS_BADGE[r.status] || ['?', 'bg-gray-50 text-gray-500'];
+      const when = r.started_at || r.scheduled_at;
+      return `<tr>
+        <td class="py-2 pr-2 num text-gray-500">#${r.id}</td>
+        <td class="py-2 pr-2"><span class="inline-flex items-center gap-1 text-xs border rounded px-1.5 py-0.5 ${cls}">${icon} ${r.status}</span></td>
+        <td class="py-2 pr-2 text-gray-600 num">${fmtTime(when)}</td>
+        <td class="py-2 pr-2 num text-right text-emerald-700">${fmt(r.sent)}</td>
+        <td class="py-2 pr-2 num text-right text-rose-700">${fmt(r.failed)}</td>
+        <td class="py-2 pr-2"><code class="text-xs text-gray-500 font-mono">${(r.audience || '').slice(0, 60)}</code></td>
+      </tr>`;
+    }).join('');
+  });
+}
+
+// ===== Tags =====
+function loadSegments() {
+  fetchJson('/api/segments').then(s => {
+    const ul = document.getElementById('tags-list');
+    ul.innerHTML = (s.tags || []).slice(0, 10).map(([tag, active, total]) => `
+      <li class="flex justify-between items-baseline">
+        <span class="font-mono text-xs text-gray-700 truncate pr-2">#${tag}</span>
+        <span class="num text-gray-500">${fmt(active)}</span>
+      </li>`).join('') || '<li class="text-gray-400 text-xs">пусто</li>';
+  });
+}
+
+// Запускаем всё
+loadStats();
+loadTimeline();
+loadBroadcasts();
+loadSegments();
+document.getElementById('last-updated').textContent = new Date().toLocaleString('ru-RU');
+</script>
+</body>
+</html>
